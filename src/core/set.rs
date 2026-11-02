@@ -146,6 +146,9 @@ pub enum SetErrorType {
     InvalidScript,
     #[serde(rename = "scriptIsActive")]
     ScriptIsActive,
+    /// A type this crate doesn't know, such as one a server adds of its own, kept as the server named it
+    #[serde(untagged)]
+    Other(String),
 }
 
 impl<O: SetObject> SetRequest<O> {
@@ -434,6 +437,7 @@ impl Display for SetErrorType {
             SetErrorType::AlreadyExists => write!(f, "alreadyExists"),
             SetErrorType::InvalidScript => write!(f, "invalidScript"),
             SetErrorType::ScriptIsActive => write!(f, "scriptIsActive"),
+            SetErrorType::Other(other) => f.write_str(other),
         }
     }
 }

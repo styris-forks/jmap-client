@@ -12,6 +12,7 @@
 use crate::{
     blob,
     core::{
+        error::ProblemDetails,
         request::{self, Request},
         response,
         session::{Session, URLPart},
@@ -20,14 +21,15 @@ use crate::{
 };
 use ahash::AHashSet;
 use encodify::base64;
+use parking_lot::RwLock;
 #[cfg(feature = "blocking")]
-use reqwest::blocking::{Client as HttpClient, Response};
+use reqwest::blocking::{Client as HttpClient, RequestBuilder, Response};
 use reqwest::{
     header::{self},
-    redirect,
+    redirect, IntoUrl, Method, StatusCode,
 };
 #[cfg(feature = "async")]
-use reqwest::{Client as HttpClient, Response};
+use reqwest::{Client as HttpClient, RequestBuilder, Response};
 use serde::de::DeserializeOwned;
 use std::{
     net::IpAddr,
@@ -39,7 +41,14 @@ use std::{
 };
 
 const DEFAULT_TIMEOUT_MS: u64 = 10 * 1000;
+/// How long an idle pooled connection is kept. Servers commonly close idle connections after 60 seconds or
+/// more, so dropping ours sooner avoids sending a request down a connection the server is closing.
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How much of an error response's body is kept in the error
+const MAX_ERROR_BODY_CHARS: usize = 500;
 static USER_AGENT: &str = concat!("jmap-client/", env!("CARGO_PKG_VERSION"));
+
+type TrustedHosts = Arc<RwLock<AHashSet<String>>>;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Credentials {
@@ -52,16 +61,21 @@ pub struct Client {
     session_url: String,
     api_url: String,
     session_updated: AtomicBool,
-    trusted_hosts: Arc<AHashSet<String>>,
+    trusted_hosts: TrustedHosts,
 
     upload_url: Vec<URLPart<blob::URLParameter>>,
     download_url: Vec<URLPart<blob::URLParameter>>,
     #[cfg(feature = "async")]
     event_source_url: Vec<URLPart<crate::event_source::URLParameter>>,
 
+    /// Pooled, and shared by every request this client makes. It holds no credentials, which are sent with
+    /// each request instead, so one HTTP client can serve many JMAP clients signed in as different accounts.
+    http: HttpClient,
+    /// Sent with every request: the credentials, and where the request came from when that was set
     headers: header::HeaderMap,
     default_account_id: String,
     timeout: Duration,
+    #[cfg(feature = "websockets")]
     pub(crate) accept_invalid_certs: bool,
 
     #[cfg(feature = "websockets")]
@@ -76,6 +90,7 @@ pub struct ClientBuilder {
     forwarded_for: Option<String>,
     accept_invalid_certs: bool,
     timeout: Duration,
+    http: Option<HttpClient>,
 }
 
 impl Default for ClientBuilder {
@@ -95,6 +110,7 @@ impl ClientBuilder {
             timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
             forwarded_for: None,
             accept_invalid_certs: false,
+            http: None,
         }
     }
 
@@ -179,6 +195,19 @@ impl ClientBuilder {
         self
     }
 
+    /// Makes requests through an HTTP client of the caller's, so several JMAP clients, even ones signed in as
+    /// different accounts, share its connection pool. Credentials are sent with each request and never set on
+    /// the HTTP client, so they stay apart.
+    ///
+    /// The HTTP client's own redirect policy, certificate checks and connect timeout apply, so this can't be
+    /// combined with [follow_redirects](struct.ClientBuilder.html#method.follow_redirects) or
+    /// [accept_invalid_certs](struct.ClientBuilder.html#method.accept_invalid_certs), and connecting fails
+    /// if it is.
+    pub fn http_client(mut self, http: HttpClient) -> Self {
+        self.http = Some(http);
+        self
+    }
+
     /// Connects to the JMAP API Session URL.
     ///
     /// Setting up [Credentials](struct.ClientBuilder.html#method.credentials) must be done before calling this function.
@@ -193,10 +222,11 @@ impl ClientBuilder {
             header::USER_AGENT,
             header::HeaderValue::from_static(USER_AGENT),
         );
-        headers.insert(
-            header::AUTHORIZATION,
-            header::HeaderValue::from_str(&authorization).unwrap(),
-        );
+        let mut credentials = header::HeaderValue::from_str(&authorization).map_err(|_| {
+            Error::Internal("The credentials can't be sent in a header".to_string())
+        })?;
+        credentials.set_sensitive(true);
+        headers.insert(header::AUTHORIZATION, credentials);
         if let Some(forwarded_for) = self.forwarded_for {
             headers.insert(
                 header::FORWARDED,
@@ -204,32 +234,29 @@ impl ClientBuilder {
             );
         }
 
-        let trusted_hosts = Arc::new(self.trusted_hosts);
+        let trusted_hosts: TrustedHosts = Arc::new(RwLock::new(self.trusted_hosts));
+        let http = match self.http {
+            Some(_) if self.accept_invalid_certs || !trusted_hosts.read().is_empty() => {
+                return Err(Error::Internal(
+                    "A caller's HTTP client keeps its own redirect and certificate settings"
+                        .to_string(),
+                ));
+            }
+            Some(http) => http,
+            None => HttpClient::builder()
+                .connect_timeout(self.timeout)
+                .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+                .danger_accept_invalid_certs(self.accept_invalid_certs)
+                .redirect(redirect_policy(trusted_hosts.clone()))
+                .build()?,
+        };
 
-        let trusted_hosts_ = trusted_hosts.clone();
         let session_url = format!("{}/.well-known/jmap", url);
         let session: Session = serde_json::from_slice(
             &Client::handle_error(
-                HttpClient::builder()
+                http.get(&session_url)
+                    .headers(headers.clone())
                     .timeout(self.timeout)
-                    .danger_accept_invalid_certs(self.accept_invalid_certs)
-                    .redirect(redirect::Policy::custom(move |attempt| {
-                        if attempt.previous().len() > 5 {
-                            attempt.error("Too many redirects.")
-                        } else if matches!( attempt.url().host_str(), Some(host) if trusted_hosts_.contains(host) )
-                        {
-                                attempt.follow()
-                        } else {
-                            let message = format!(
-                                "Aborting redirect request to unknown host '{}'.",
-                                attempt.url().host_str().unwrap_or("")
-                            );
-                            attempt.error(message)
-                        }
-                    }))
-                    .default_headers(headers.clone())
-                    .build()?
-                    .get(&session_url)
                     .send()
                     .await?,
             )
@@ -244,11 +271,6 @@ impl ClientBuilder {
             .map(|a| a.1.to_string())
             .unwrap_or_default();
 
-        headers.insert(
-            header::CONTENT_TYPE,
-            header::HeaderValue::from_static("application/json"),
-        );
-
         Ok(Client {
             download_url: URLPart::parse(session.download_url())?,
             upload_url: URLPart::parse(session.upload_url())?,
@@ -258,8 +280,10 @@ impl ClientBuilder {
             session: parking_lot::Mutex::new(Arc::new(session)),
             session_url,
             session_updated: true.into(),
+            #[cfg(feature = "websockets")]
             accept_invalid_certs: self.accept_invalid_certs,
             trusted_hosts,
+            http,
             #[cfg(feature = "websockets")]
             authorization,
             timeout: self.timeout,
@@ -268,6 +292,40 @@ impl ClientBuilder {
             #[cfg(feature = "websockets")]
             ws: None.into(),
         })
+    }
+}
+
+/// Follows at most 5 redirects, and only to a trusted host. The hosts are read on each redirect, so changing
+/// them later takes effect without rebuilding the HTTP client.
+fn redirect_policy(trusted_hosts: TrustedHosts) -> redirect::Policy {
+    redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() > 5 {
+            attempt.error("Too many redirects.")
+        } else if matches!(attempt.url().host_str(), Some(host) if trusted_hosts.read().contains(host))
+        {
+            attempt.follow()
+        } else {
+            let message = format!(
+                "Aborting redirect request to unknown host '{}'.",
+                attempt.url().host_str().unwrap_or("")
+            );
+            attempt.error(message)
+        }
+    })
+}
+
+/// A short, single-line excerpt of an error response's body after its status
+fn describe_failure(status: StatusCode, body: &[u8]) -> String {
+    let text = String::from_utf8_lossy(body);
+    let mut excerpt = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if let Some((cut, _)) = excerpt.char_indices().nth(MAX_ERROR_BODY_CHARS) {
+        excerpt.truncate(cut);
+        excerpt.push('…');
+    }
+    if excerpt.is_empty() {
+        status.to_string()
+    } else {
+        format!("{}: {}", status, excerpt)
     }
 }
 
@@ -282,11 +340,14 @@ impl Client {
         self
     }
 
+    /// Changes the hosts redirects are followed to, from the next request on. A client given its own HTTP client
+    /// through [ClientBuilder.http_client()](struct.ClientBuilder.html#method.http_client) follows that
+    /// client's redirect policy instead, so this changes nothing for it.
     pub fn set_follow_redirects(
         &mut self,
         trusted_hosts: impl IntoIterator<Item = impl Into<String>>,
     ) -> &mut Self {
-        self.trusted_hosts = Arc::new(trusted_hosts.into_iter().map(|h| h.into()).collect());
+        *self.trusted_hosts.write() = trusted_hosts.into_iter().map(|h| h.into()).collect();
         self
     }
 
@@ -306,22 +367,19 @@ impl Client {
         &self.headers
     }
 
-    pub(crate) fn redirect_policy(&self) -> redirect::Policy {
-        let trusted_hosts = self.trusted_hosts.clone();
-        redirect::Policy::custom(move |attempt| {
-            if attempt.previous().len() > 5 {
-                attempt.error("Too many redirects.")
-            } else if matches!( attempt.url().host_str(), Some(host) if trusted_hosts.contains(host) )
-            {
-                attempt.follow()
-            } else {
-                let message = format!(
-                    "Aborting redirect request to unknown host '{}'.",
-                    attempt.url().host_str().unwrap_or("")
-                );
-                attempt.error(message)
-            }
-        })
+    /// A request through the shared HTTP client, carrying this client's credentials. With a timeout it has to
+    /// finish within it, and without one only connecting is bounded, which suits long-lived streams.
+    pub(crate) fn http_request(
+        &self,
+        method: Method,
+        url: impl IntoUrl,
+        timeout: Option<Duration>,
+    ) -> RequestBuilder {
+        let request = self.http.request(method, url).headers(self.headers.clone());
+        match timeout {
+            Some(timeout) => request.timeout(timeout),
+            None => request,
+        }
     }
 
     #[maybe_async::maybe_async]
@@ -334,13 +392,11 @@ impl Client {
     {
         let response: response::Response<R> = serde_json::from_slice(
             &Client::handle_error(
-                HttpClient::builder()
-                    .redirect(self.redirect_policy())
-                    .danger_accept_invalid_certs(self.accept_invalid_certs)
-                    .timeout(self.timeout)
-                    .default_headers(self.headers.clone())
-                    .build()?
-                    .post(&self.api_url)
+                self.http_request(Method::POST, &self.api_url, Some(self.timeout))
+                    .header(
+                        header::CONTENT_TYPE,
+                        header::HeaderValue::from_static("application/json"),
+                    )
                     .body(serde_json::to_string(&request)?)
                     .send()
                     .await?,
@@ -361,15 +417,13 @@ impl Client {
     pub async fn refresh_session(&self) -> crate::Result<()> {
         let session: Session = serde_json::from_slice(
             &Client::handle_error(
-                HttpClient::builder()
-                    .timeout(Duration::from_millis(DEFAULT_TIMEOUT_MS))
-                    .danger_accept_invalid_certs(self.accept_invalid_certs)
-                    .redirect(self.redirect_policy())
-                    .default_headers(self.headers.clone())
-                    .build()?
-                    .get(&self.session_url)
-                    .send()
-                    .await?,
+                self.http_request(
+                    Method::GET,
+                    &self.session_url,
+                    Some(Duration::from_millis(DEFAULT_TIMEOUT_MS)),
+                )
+                .send()
+                .await?,
             )
             .await?
             .bytes()
@@ -410,21 +464,28 @@ impl Client {
         &self.event_source_url
     }
 
+    /// Passes a successful response through, and turns any other into an error saying why. The body is read
+    /// either way, which also frees a pooled connection for reuse.
     #[maybe_async::maybe_async]
     pub async fn handle_error(response: Response) -> crate::Result<Response> {
-        if response.status().is_success() {
-            Ok(response)
-        } else if let Some(b"application/problem+json") = response
+        let status = response.status();
+        if status.is_success() {
+            return Ok(response);
+        }
+        let is_problem = response
             .headers()
             .get(header::CONTENT_TYPE)
-            .map(|h| h.as_bytes())
-        {
-            Err(Error::Problem(serde_json::from_slice(
-                &response.bytes().await?,
-            )?))
-        } else {
-            Err(Error::Server(format!("{}", response.status())))
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/problem+json"));
+        let body = response.bytes().await?;
+        if is_problem {
+            if let Ok(mut problem) = serde_json::from_slice::<ProblemDetails>(&body) {
+                problem.status.get_or_insert(u32::from(status.as_u16()));
+                return Err(Error::Problem(Box::new(problem)));
+            }
         }
+        Err(Error::Server(describe_failure(status, &body)))
     }
 }
 

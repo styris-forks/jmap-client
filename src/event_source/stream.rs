@@ -16,7 +16,10 @@ use crate::{
     DataType,
 };
 use futures_util::{Stream, StreamExt};
-use reqwest::header::{HeaderValue, ACCEPT, CONTENT_TYPE};
+use reqwest::{
+    header::{HeaderValue, ACCEPT},
+    Method,
+};
 
 impl Client {
     pub async fn event_source(
@@ -61,30 +64,21 @@ impl Client {
             }
         }
 
-        // Add headers
-        let mut headers = self.headers().clone();
-        headers.remove(CONTENT_TYPE);
-        headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
+        // The stream stays open for as long as it's read, so it has no overall timeout
+        let mut request = self
+            .http_request(Method::GET, event_source_url, None)
+            .header(ACCEPT, HeaderValue::from_static("text/event-stream"));
         if let Some(last_event_id) = last_event_id {
-            headers.insert(
+            request = request.header(
                 "Last-Event-ID",
-                HeaderValue::from_str(last_event_id).unwrap(),
+                HeaderValue::from_str(last_event_id)
+                    .map_err(|_| crate::Error::Internal("Invalid Last-Event-ID".to_string()))?,
             );
         }
 
-        let mut stream = Client::handle_error(
-            reqwest::Client::builder()
-                .connect_timeout(self.timeout())
-                .danger_accept_invalid_certs(self.accept_invalid_certs)
-                .redirect(self.redirect_policy())
-                .default_headers(headers)
-                .build()?
-                .get(event_source_url)
-                .send()
-                .await?,
-        )
-        .await?
-        .bytes_stream();
+        let mut stream = Client::handle_error(request.send().await?)
+            .await?
+            .bytes_stream();
         let mut parser = EventParser::default();
 
         Ok(Box::pin(async_stream::stream! {

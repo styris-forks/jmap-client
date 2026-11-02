@@ -437,7 +437,17 @@ pub enum Error {
     WebSocket(tokio_tungstenite::tungstenite::error::Error),
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Transport(e) => Some(e),
+            Error::Parse(e) => Some(e),
+            #[cfg(feature = "websockets")]
+            Error::WebSocket(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 impl From<reqwest::Error> for Error {
     fn from(e: reqwest::Error) -> Self {

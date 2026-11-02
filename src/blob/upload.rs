@@ -9,15 +9,10 @@
  * except according to those terms.
  */
 
-use reqwest::header::CONTENT_TYPE;
+use reqwest::{header::CONTENT_TYPE, Method};
 use serde::Deserialize;
 
 use crate::{client::Client, core::session::URLPart};
-
-#[cfg(feature = "blocking")]
-use reqwest::blocking::Client as HttpClient;
-#[cfg(feature = "async")]
-use reqwest::Client as HttpClient;
 
 #[derive(Debug, Deserialize)]
 pub struct UploadResponse {
@@ -61,13 +56,7 @@ impl Client {
 
         serde_json::from_slice::<UploadResponse>(
             &Client::handle_error(
-                HttpClient::builder()
-                    .timeout(self.timeout())
-                    .danger_accept_invalid_certs(self.accept_invalid_certs)
-                    .redirect(self.redirect_policy())
-                    .default_headers(self.headers().clone())
-                    .build()?
-                    .post(upload_url)
+                self.http_request(Method::POST, upload_url, Some(self.timeout()))
                     .header(
                         CONTENT_TYPE,
                         content_type.unwrap_or("application/octet-stream"),

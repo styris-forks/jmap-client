@@ -47,6 +47,8 @@ pub enum ProblemType {
 pub struct MethodError {
     #[serde(rename = "type")]
     pub p_type: MethodErrorType,
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -91,6 +93,9 @@ pub enum MethodErrorType {
     UnsupportedFilter,
     #[serde(rename = "tooManyChanges")]
     TooManyChanges,
+    /// A type this crate doesn't know, such as one a server adds of its own, kept as the server named it
+    #[serde(untagged)]
+    Other(String),
 }
 
 impl ProblemDetails {
@@ -141,11 +146,25 @@ impl MethodError {
     pub fn error(&self) -> &MethodErrorType {
         &self.p_type
     }
+
+    pub fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
 }
 
 impl Display for MethodError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.p_type {
+        self.p_type.fmt(f)?;
+        if let Some(description) = &self.description {
+            write!(f, ": {}", description)?;
+        }
+        Ok(())
+    }
+}
+
+impl Display for MethodErrorType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
             MethodErrorType::ServerUnavailable => write!(f, "Server unavailable"),
             MethodErrorType::ServerFail => write!(f, "Server fail"),
             MethodErrorType::ServerPartialFail => write!(f, "Server partial fail"),
@@ -170,6 +189,7 @@ impl Display for MethodError {
             MethodErrorType::UnsupportedSort => write!(f, "Unsupported sort"),
             MethodErrorType::UnsupportedFilter => write!(f, "Unsupported filter"),
             MethodErrorType::TooManyChanges => write!(f, "Too many changes"),
+            MethodErrorType::Other(other) => f.write_str(other),
         }
     }
 }

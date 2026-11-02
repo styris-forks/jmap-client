@@ -1,3 +1,14 @@
+Unreleased (fork)
+================================
+- Reuse one pooled HTTP client for every request instead of building one per request. Credentials are sent
+  with each request, so `ClientBuilder::http_client` can share one HTTP client between clients signed in as
+  different accounts.
+- `set_follow_redirects` now takes effect on later requests.
+- Errors from non-JMAP responses include the status and an excerpt of the body. Problem details are recognised
+  when their content type has parameters, and fall back to the body excerpt when they can't be parsed.
+- Method errors keep their `description`, and unknown method and set error types parse as `Other`.
+- `Error` reports its underlying cause through `source()`.
+
 jmap-client 0.4.3
 ================================
 - Replace `base64` with `encodify`.
