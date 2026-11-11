@@ -202,6 +202,7 @@ use crate::core::set::SetError;
 use ahash::AHashMap;
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
+use std::time::Duration;
 
 #[cfg(feature = "websockets")]
 pub mod client_ws;
@@ -433,6 +434,8 @@ pub enum Error {
     Server(String),
     Method(MethodError),
     Set(SetError<String>),
+    /// The server refused the request for coming too often (HTTP 429), with how long it said to wait when it did
+    RateLimited(Option<Duration>),
     #[cfg(feature = "websockets")]
     WebSocket(tokio_tungstenite::tungstenite::error::Error),
 }
@@ -502,6 +505,10 @@ impl Display for Error {
             Error::Server(e) => write!(f, "Server failed: {}", e),
             Error::Method(e) => write!(f, "Request failed: {}", e),
             Error::Set(e) => write!(f, "Set failed: {}", e),
+            Error::RateLimited(Some(wait)) => {
+                write!(f, "Rate limited, retry in {} seconds", wait.as_secs())
+            }
+            Error::RateLimited(None) => write!(f, "Rate limited"),
             #[cfg(feature = "websockets")]
             Error::WebSocket(e) => write!(f, "WebSockets error: {}", e),
         }

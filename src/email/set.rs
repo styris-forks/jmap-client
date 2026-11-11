@@ -232,6 +232,7 @@ impl SetObject for Email<Set> {
             attachments: Default::default(),
             has_attachment: Default::default(),
             preview: Default::default(),
+            header_list: Default::default(),
             headers: Default::default(),
             patch: Default::default(),
         }

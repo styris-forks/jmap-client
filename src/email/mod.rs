@@ -183,6 +183,10 @@ pub struct Email<State = Get> {
     #[serde(skip_serializing_if = "Option::is_none")]
     preview: Option<String>,
 
+    #[serde(rename = "headers")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    header_list: Option<Vec<EmailHeader>>,
+
     #[serde(flatten)]
     #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
     headers: AHashMap<Header, Option<HeaderValue>>,
@@ -322,6 +326,7 @@ pub enum Property {
     Attachments,
     HasAttachment,
     Preview,
+    Headers,
     Header(Header),
     Other(String),
 }
@@ -386,6 +391,7 @@ impl Property {
             "htmlBody" => Some(Property::HtmlBody),
             "attachments" => Some(Property::Attachments),
             "bodyStructure" => Some(Property::BodyStructure),
+            "headers" => Some(Property::Headers),
             _ if value.starts_with("header:") => Some(Property::Header(Header::parse(value)?)),
             _ => Some(Property::Other(value.to_string())),
         }
@@ -420,6 +426,7 @@ impl Display for Property {
             Property::Attachments => write!(f, "attachments"),
             Property::HasAttachment => write!(f, "hasAttachment"),
             Property::Preview => write!(f, "preview"),
+            Property::Headers => write!(f, "headers"),
             Property::Header(header) => header.fmt(f),
             Property::Other(other) => write!(f, "{}", other),
         }

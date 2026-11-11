@@ -314,6 +314,27 @@ fn redirect_policy(trusted_hosts: TrustedHosts) -> redirect::Policy {
     })
 }
 
+/// How long a 429 says to wait: its `Retry-After`, in seconds or as a date, or else the latest reset in its
+/// `RateLimit` header, which lists each policy's state as `"requests";r=0;t=30`
+fn retry_after(headers: &header::HeaderMap) -> Option<Duration> {
+    let text = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
+    if let Some(value) = text("retry-after").map(str::trim) {
+        if let Ok(seconds) = value.parse::<u64>() {
+            return Some(Duration::from_secs(seconds));
+        }
+        if let Ok(date) = chrono::DateTime::parse_from_rfc2822(value) {
+            let wait = date.with_timezone(&chrono::Utc) - chrono::Utc::now();
+            return Some(wait.to_std().unwrap_or_default());
+        }
+    }
+    text("ratelimit")?
+        .split(',')
+        .flat_map(|policy| policy.split(';').skip(1))
+        .filter_map(|param| param.trim().strip_prefix("t=")?.parse::<u64>().ok())
+        .max()
+        .map(Duration::from_secs)
+}
+
 /// A short, single-line excerpt of an error response's body after its status
 fn describe_failure(status: StatusCode, body: &[u8]) -> String {
     let text = String::from_utf8_lossy(body);
@@ -465,12 +486,18 @@ impl Client {
     }
 
     /// Passes a successful response through, and turns any other into an error saying why. The body is read
-    /// either way, which also frees a pooled connection for reuse.
+    /// either way, which also frees a pooled connection for reuse. A 429 becomes
+    /// [Error::RateLimited](enum.Error.html#variant.RateLimited) with how long its headers say to wait.
     #[maybe_async::maybe_async]
     pub async fn handle_error(response: Response) -> crate::Result<Response> {
         let status = response.status();
         if status.is_success() {
             return Ok(response);
+        }
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            let wait = retry_after(response.headers());
+            let _ = response.bytes().await;
+            return Err(Error::RateLimited(wait));
         }
         let is_problem = response
             .headers()

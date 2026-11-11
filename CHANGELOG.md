@@ -8,6 +8,8 @@ Unreleased (fork)
   when their content type has parameters, and fall back to the body excerpt when they can't be parsed.
 - Method errors keep their `description`, and unknown method and set error types parse as `Other`.
 - `Error` reports its underlying cause through `source()`.
+- `Client::download_response` starts a blob download whose body can be streamed, without the API timeout.
+- A 429 response is `Error::RateLimited`, with the wait its `Retry-After` or `RateLimit` header gives.
 
 jmap-client 0.4.3
 ================================

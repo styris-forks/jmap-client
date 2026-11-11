@@ -173,6 +173,11 @@ impl Email<Get> {
         self.headers.get(id).and_then(|v| v.as_ref())
     }
 
+    /// Every header field of the message, raw and in message order
+    pub fn headers(&self) -> Option<&[EmailHeader]> {
+        self.header_list.as_deref()
+    }
+
     pub fn has_header(&self, id: &Header) -> bool {
         self.headers.contains_key(id)
     }
